@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import polars as pl
 import typer
 from dotenv import load_dotenv
 
@@ -16,9 +19,17 @@ from dispatcher_watts.data.ercot import GridstatusERCOTSource
 from dispatcher_watts.data.schemas import ERCOT_HUBS, RTM_INTERVAL_MINUTES
 from dispatcher_watts.data.store import (
     cache_path,
+    is_cached,
     load_prices,
     save_prices,
     summarize_prices,
+)
+from dispatcher_watts.reporting.charts import (
+    cumulative_revenue_chart,
+    daily_revenue_chart,
+    dispatch_chart,
+    save_figure,
+    soc_chart,
 )
 from dispatcher_watts.strategies.base import Strategy
 from dispatcher_watts.strategies.perfect_foresight import PerfectForesightStrategy
@@ -201,6 +212,73 @@ def compare(
         money = "$" + format(revenue[name], ",.0f")
         rate = capture_rate(revenue[name], ceiling)
         typer.echo(f"  {name:<18}{money:>13}{rate:>9.1%}{cycles[name]:>9.1f}")
+
+
+@app.command("reproduce-v1")
+def reproduce_v1() -> None:
+    """Regenerate every v1 result from scratch.
+
+    Fetches any missing hub-years (needs GRIDSTATUS_API_KEY), backtests all
+    three strategies across both years and all four hubs, writes the results
+    table to results/v1/results.csv, and saves charts for one representative
+    hub-year.
+    """
+    spec = BatterySpec()
+    out_dir = Path("results") / "v1"
+    rows: list[dict[str, object]] = []
+
+    for year in (2024, 2025):
+        for hub in ERCOT_HUBS:
+            if not is_cached(year, hub):
+                typer.echo(f"fetching missing data: {hub} {year} ...")
+                save_prices(GridstatusERCOTSource().get_rtm_prices(year, hub), year, hub)
+            prices = load_prices(year, hub)
+            metrics: dict[str, BacktestMetrics] = {}
+            for name in _STRATEGIES:
+                strat = _build_strategy(
+                    name,
+                    spec=spec,
+                    interval_minutes=RTM_INTERVAL_MINUTES,
+                    charge_below=20.0,
+                    discharge_above=50.0,
+                    window_hours=24.0,
+                    band=0.0,
+                )
+                metrics[name] = compute_metrics(run_backtest(prices, Battery(spec), strat))
+            ceiling = metrics["perfect-foresight"].total_revenue
+            for name, result_metrics in metrics.items():
+                rows.append(
+                    {
+                        "year": year,
+                        "hub": hub,
+                        "strategy": name,
+                        "revenue": round(result_metrics.total_revenue, 2),
+                        "capture_rate": round(
+                            capture_rate(result_metrics.total_revenue, ceiling), 4
+                        ),
+                        "equivalent_cycles": round(result_metrics.equivalent_full_cycles, 1),
+                    }
+                )
+            typer.echo(f"  backtested {hub} {year}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "results.csv"
+    pl.DataFrame(rows).write_csv(csv_path)
+    typer.echo(f"\nwrote results table -> {csv_path}")
+
+    # Charts for one representative hub-year.
+    sample = run_backtest(
+        load_prices(2024, "HB_HOUSTON"), Battery(spec), PerfectForesightStrategy(spec)
+    )
+    charts_dir = out_dir / "charts"
+    for label, figure in (
+        ("dispatch", dispatch_chart(sample)),
+        ("soc", soc_chart(sample)),
+        ("cumulative_revenue", cumulative_revenue_chart(sample)),
+        ("daily_revenue", daily_revenue_chart(sample)),
+    ):
+        save_figure(figure, charts_dir / f"{label}_HB_HOUSTON_2024.html")
+    typer.echo(f"wrote charts -> {charts_dir}")
 
 
 if __name__ == "__main__":
