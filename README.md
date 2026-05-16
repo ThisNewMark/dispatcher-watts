@@ -50,8 +50,10 @@ Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 # Install dependencies
 uv sync
 
-# Set your gridstatus.io API key (https://www.gridstatus.io/settings/api)
-export GRIDSTATUS_API_KEY=your_api_key
+# Add your gridstatus.io API key: copy the template, then paste your key in.
+# Get a key (free tier available) at https://www.gridstatus.io/settings/api
+cp .env.example .env
+# ...then edit .env and set GRIDSTATUS_API_KEY=your_key
 
 # Fetch one year of real-time prices for one hub (cached locally as parquet)
 uv run dispatcher-watts data fetch --year 2025 --hub HB_HOUSTON

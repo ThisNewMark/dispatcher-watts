@@ -109,8 +109,12 @@ volatile. Each ISO runs two coupled markets:
 
 - **Day-Ahead Market (DAM):** hourly prices set the day before delivery, based on
   bids and forecasted demand. Settled in $/MWh.
-- **Real-Time Market (RTM):** 5-minute prices (or 15-min in some ISOs) reflect
-  actual conditions during delivery. Much more volatile than DAM.
+- **Real-Time Market (RTM):** prices that reflect actual conditions during
+  delivery, much more volatile than DAM. ERCOT runs SCED (the dispatch engine)
+  every 5 minutes, but **real-time settlement point prices — the prices a
+  battery actually settles against — are 15-minute** time-weighted values. The
+  5-minute series is locational marginal prices (LMPs) before real-time
+  adders, not the settlement price. v1 uses the 15-minute RTM SPP series.
 
 A battery operator can participate in both. v1 only considers RTM dispatch
 against RTM prices — this is the simplest and most volatile case.
@@ -132,7 +136,7 @@ v1 default spec: 1 MWh capacity, 500 kW power (so 2-hour duration), 0.87 RTE.
 
 ### Dispatch and revenue
 
-At each timestep (5-min interval), the strategy decides: charge, discharge, or
+At each timestep (15-min interval), the strategy decides: charge, discharge, or
 idle. The battery model enforces constraints (cannot discharge more than current
 SoC, cannot charge above capacity, cannot exceed power rating).
 
@@ -157,8 +161,9 @@ strategy you'd ever deploy — it's a benchmark for evaluating real strategies.
 
 ERCOT publishes settlement prices via their public API. Key endpoints:
 
-- **RTM Settlement Point Prices:** 5-minute prices at hundreds of nodes. Use
-  hub prices (HB_HOUSTON, HB_NORTH, HB_SOUTH, HB_WEST) for v1.
+- **RTM Settlement Point Prices:** 15-minute prices at hundreds of nodes. Use
+  hub prices (HB_HOUSTON, HB_NORTH, HB_SOUTH, HB_WEST) for v1. (Sourced in v1
+  via the gridstatus.io `ercot_spp_real_time_15_min` dataset.)
 - **DAM Settlement Point Prices:** hourly day-ahead prices.
 
 Their public reports portal: https://www.ercot.com/mp/data-products
@@ -205,7 +210,7 @@ cherry-picking) is a credibility multiplier.
 - [ ] Write tests for data loading
 - [ ] First commit, push, CI green
 
-**Definition of done:** can fetch 1 year of 5-min prices for one hub, load
+**Definition of done:** can fetch 1 year of 15-min prices for one hub, load
 into a polars DataFrame, run a basic statistical summary.
 
 ### Week 2: Battery model + threshold strategy

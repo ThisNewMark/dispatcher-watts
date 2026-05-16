@@ -18,6 +18,7 @@ dependencies = [
     "pulp>=2.8",
     "scipy>=1.13",
     "gridstatusio[polars]>=0.15",
+    "python-dotenv>=1.0",
 ]
 
 [project.scripts]

@@ -1,6 +1,10 @@
 # Market data — fetched locally, never committed (gridstatus row budget)
 /data/
 
+# Local secrets — copy .env.example to .env and paste your key there.
+# .env.example IS committed as a template; .env never is.
+.env
+
 # Python
 __pycache__/
 *.py[cod]

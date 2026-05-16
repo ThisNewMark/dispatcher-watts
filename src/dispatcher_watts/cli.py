@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import typer
+from dotenv import load_dotenv
 
 from dispatcher_watts.data.ercot import GridstatusERCOTSource
 from dispatcher_watts.data.schemas import ERCOT_HUBS
@@ -12,6 +13,10 @@ from dispatcher_watts.data.store import (
     save_prices,
     summarize_prices,
 )
+
+# Load GRIDSTATUS_API_KEY (and any other vars) from a local .env file, if one
+# exists. Real environment variables always take precedence.
+load_dotenv()
 
 app = typer.Typer(
     help="Backtest battery dispatch strategies against ERCOT market data.",
