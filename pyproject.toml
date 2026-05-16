@@ -40,6 +40,12 @@ dev = [
     "mypy>=1.10",
 ]
 
+# Optional: tools to run the analysis notebook (notebooks/results_v1.ipynb).
+# Install with `uv sync --group notebook`, then run `uv run jupyter lab`.
+notebook = [
+    "jupyterlab>=4.0",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

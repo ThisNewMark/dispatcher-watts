@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import polars as pl
@@ -26,6 +27,7 @@ from dispatcher_watts.data.store import (
 )
 from dispatcher_watts.reporting.charts import (
     cumulative_revenue_chart,
+    cumulative_revenue_comparison_chart,
     daily_revenue_chart,
     dispatch_chart,
     save_figure,
@@ -220,8 +222,8 @@ def reproduce_v1() -> None:
 
     Fetches any missing hub-years (needs GRIDSTATUS_API_KEY), backtests all
     three strategies across both years and all four hubs, writes the results
-    table to results/v1/results.csv, and saves charts for one representative
-    hub-year.
+    table to results/v1/results.csv, and saves charts for every strategy on
+    one representative hub-year (HB_HOUSTON 2024).
     """
     spec = BatterySpec()
     out_dir = Path("results") / "v1"
@@ -266,18 +268,37 @@ def reproduce_v1() -> None:
     pl.DataFrame(rows).write_csv(csv_path)
     typer.echo(f"\nwrote results table -> {csv_path}")
 
-    # Charts for one representative hub-year.
-    sample = run_backtest(
-        load_prices(2024, "HB_HOUSTON"), Battery(spec), PerfectForesightStrategy(spec)
-    )
+    # Charts for one representative hub-year (HB_HOUSTON 2024): the four charts
+    # for every strategy, in a per-strategy subfolder, plus one comparison
+    # chart overlaying all strategies' cumulative revenue.
     charts_dir = out_dir / "charts"
-    for label, figure in (
-        ("dispatch", dispatch_chart(sample)),
-        ("soc", soc_chart(sample)),
-        ("cumulative_revenue", cumulative_revenue_chart(sample)),
-        ("daily_revenue", daily_revenue_chart(sample)),
-    ):
-        save_figure(figure, charts_dir / f"{label}_HB_HOUSTON_2024.html")
+    if charts_dir.exists():
+        shutil.rmtree(charts_dir)  # clear stale charts from a previous run
+    sample_prices = load_prices(2024, "HB_HOUSTON")
+    sample_results: dict[str, BacktestResult] = {}
+    for name in _STRATEGIES:
+        strat = _build_strategy(
+            name,
+            spec=spec,
+            interval_minutes=RTM_INTERVAL_MINUTES,
+            charge_below=20.0,
+            discharge_above=50.0,
+            window_hours=24.0,
+            band=0.0,
+        )
+        result = run_backtest(sample_prices, Battery(spec), strat)
+        sample_results[name] = result
+        for label, figure in (
+            ("dispatch", dispatch_chart(result)),
+            ("soc", soc_chart(result)),
+            ("cumulative_revenue", cumulative_revenue_chart(result)),
+            ("daily_revenue", daily_revenue_chart(result)),
+        ):
+            save_figure(figure, charts_dir / name / f"{label}_HB_HOUSTON_2024.html")
+    save_figure(
+        cumulative_revenue_comparison_chart(sample_results),
+        charts_dir / "comparison_cumulative_revenue_HB_HOUSTON_2024.html",
+    )
     typer.echo(f"wrote charts -> {charts_dir}")
 
 

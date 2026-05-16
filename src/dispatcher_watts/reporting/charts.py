@@ -18,6 +18,9 @@ _CHARGE_COLOR = "#e76f51"
 _DISCHARGE_COLOR = "#2a9d8f"
 _NEUTRAL_COLOR = "#264653"
 
+# Distinct line colors for the multi-strategy comparison chart.
+_COMPARISON_COLORS = ("#264653", "#e76f51", "#2a9d8f", "#e9c46a")
+
 
 def _styled(fig: go.Figure, title: str, x_title: str, y_title: str) -> go.Figure:
     fig.update_layout(
@@ -106,6 +109,28 @@ def daily_revenue_chart(result: BacktestResult) -> go.Figure:
         marker={"color": _DISCHARGE_COLOR},
     )
     return _styled(fig, f"Daily revenue — {result.strategy_name}", "Day", "Revenue ($)")
+
+
+def cumulative_revenue_comparison_chart(
+    results: dict[str, BacktestResult],
+) -> go.Figure:
+    """Cumulative revenue of several strategies on one figure.
+
+    `results` maps a strategy label to its backtest result; all results should
+    cover the same period. This is the chart that makes the gap between a naive
+    strategy and the perfect-foresight ceiling visible at a glance.
+    """
+    fig = go.Figure()
+    for (label, result), color in zip(results.items(), _COMPARISON_COLORS, strict=False):
+        frame = result.frame
+        fig.add_scatter(
+            x=frame["interval_start"].to_list(),
+            y=frame["cumulative_revenue"].to_list(),
+            mode="lines",
+            name=label,
+            line={"color": color, "width": 2},
+        )
+    return _styled(fig, "Cumulative revenue by strategy", "Time", "Revenue ($)")
 
 
 def save_figure(fig: go.Figure, path: Path) -> Path:

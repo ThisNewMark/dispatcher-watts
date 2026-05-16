@@ -11,6 +11,18 @@ wholesale market mechanics.
 dispatcher — battery dispatch + flexible compute load scheduling + grid harmonics
 smoothing. v1 is the foundation. Do not over-engineer for v2 yet.
 
+**Positioning.** The commercial dispatch space is crowded and well-funded
+(Ascend Analytics, Habitat Energy, Tyba, Gridmatic, CES, GridBeyond, Fluence,
+and others). dispatcher-watts does NOT compete with them — it is not a SaaS and
+makes no claim to beat them. Its niche is the gap they leave: there is no
+serious, maintained, US-market-focused open-source battery dispatcher. The
+value proposition is a transparent reference implementation of what storage
+operators keep proprietary — a learning artifact and a credibility signal, not
+a product. Do not let the README or blog post claim to outperform commercial
+tools; that invites scrutiny the project would lose. Avoid hard "first ever"
+claims for the same reason — frame it as filling an empty space, not winning a
+race.
+
 **Author context:** strong full-stack and Python skills, fluent with LLM-assisted
 development via Claude Code. New to wholesale electricity markets — assume the
 domain knowledge is being built alongside the code.
@@ -116,6 +128,35 @@ volatile. Each ISO runs two coupled markets:
   5-minute series is locational marginal prices (LMPs) before real-time
   adders, not the settlement price. v1 uses the 15-minute RTM SPP series.
 
+#### RTC+B — the December 2025 market redesign
+
+On **December 5, 2025**, ERCOT went live with **RTC+B (Real-Time
+Co-optimization plus Batteries)** — its largest market design change since the
+nodal market launched in 2010. RTC+B co-optimizes energy and ancillary services
+together in real time (every 5 minutes) instead of awarding ancillary services
+separately a day ahead, and it models batteries as a single energy storage
+resource with state-of-charge constraints baked into dispatch. Industry framing:
+it compresses the "structural alpha" from exploiting market-design gaps and
+shifts the game toward "system alpha" — delivering precise flexibility when the
+grid needs it.
+
+**What this means for v1 — read carefully, it is an honesty trap.** RTC+B went
+live on Dec 5, 2025, so the v1 dataset is **almost entirely pre-RTC+B**: all of
+2024 and ~93% of 2025 (Jan 1 – Dec 4) are the old regime; only the last 27 days
+of 2025 are post-RTC+B. Therefore:
+
+- The v1 2024-vs-2025 comparison is **pre-RTC+B vs pre-RTC+B**. The revenue
+  compression it shows is the battery-saturation story — it is NOT an RTC+B
+  effect. Do not let the blog post or README imply v1 measures the RTC+B
+  transition; it does not, and a knowledgeable reader would catch it.
+- Frame v1 results as a clean **pre-RTC+B baseline**. That is a feature: it is
+  the reference line a genuine before/after comparison will measure against.
+- The real RTC+B before/after is **future work** — rerun the backtest once a
+  full year of 2026 post-RTC+B data exists. This is a v2 / follow-up item, and
+  a strong narrative hook for a second post.
+- RTC+B is still worth naming in the blog post as the regime our data belongs
+  to and as the obvious next chapter — just accurately.
+
 A battery operator can participate in both. v1 only considers RTM dispatch
 against RTM prices — this is the simplest and most volatile case.
 
@@ -198,6 +239,12 @@ and report results side-by-side — this shows the strategy's behavior under
 different market conditions, including the compression of arbitrage spreads
 as battery saturation has grown. Showing both years honestly (rather than
 cherry-picking) is a credibility multiplier.
+
+Both years are essentially the **pre-RTC+B regime** (see the RTC+B section
+above): RTC+B went live Dec 5, 2025, so only the last 27 days of the 2025
+dataset are post-RTC+B. Treat the v1 numbers as a pre-RTC+B baseline. Do not
+re-fetch the 2025 data to exclude those 27 days — just disclose the ~7%
+contamination of the 2025 annual figure honestly.
 
 ## v1 milestones (4 weeks)
 
@@ -333,6 +380,10 @@ For the conceptual model:
   multiplier in this industry.
 - Do NOT cherry-pick the best year, the best hub, or the best strategy
   parameters. Show full results, including poor performance.
+- v1 results are a **pre-RTC+B baseline**, not a measurement of the RTC+B
+  market change (RTC+B went live Dec 5, 2025; the v1 data is ~93% pre-RTC+B).
+  Do not let the blog post or README imply otherwise. Disclose that the 2025
+  annual figure includes ~27 post-RTC+B days. See the RTC+B section above.
 
 ---
 
