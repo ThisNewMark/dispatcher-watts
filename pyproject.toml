@@ -64,7 +64,7 @@ disallow_untyped_defs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
 
-# gridstatusio and pulp ship no type stubs.
+# gridstatusio, pulp, and plotly ship no (complete) type stubs.
 [[tool.mypy.overrides]]
-module = ["gridstatusio.*", "pulp.*"]
+module = ["gridstatusio.*", "pulp.*", "plotly.*"]
 ignore_missing_imports = true
