@@ -8,8 +8,9 @@ import polars as pl
 import pytest
 
 from dispatcher_watts.backtest.engine import run_backtest
-from dispatcher_watts.backtest.metrics import compute_metrics
+from dispatcher_watts.backtest.metrics import capture_rate, compute_metrics
 from dispatcher_watts.battery.model import Battery, BatterySpec
+from dispatcher_watts.strategies.perfect_foresight import PerfectForesightStrategy
 from dispatcher_watts.strategies.threshold import ThresholdStrategy
 
 
@@ -62,3 +63,31 @@ def test_run_backtest_rejects_bad_schema() -> None:
     bad = pl.DataFrame({"interval_start": [1, 2], "price": [3.0, 4.0]})
     with pytest.raises(ValueError, match="RTM_PRICE_SCHEMA"):
         run_backtest(bad, _lossless_battery(), ThresholdStrategy(20.0, 50.0))
+
+
+def test_capture_rate() -> None:
+    assert capture_rate(50.0, 100.0) == pytest.approx(0.5)
+    assert capture_rate(50.0, 0.0) == 0.0  # no ceiling -> nothing to capture
+    assert capture_rate(10.0, -5.0) == 0.0
+
+
+def test_perfect_foresight_is_a_revenue_ceiling() -> None:
+    # Perfect foresight must earn at least as much as any other strategy on the
+    # same prices, so the capture rate is bounded by 1.
+    prices = _prices([10.0, 80.0, 15.0, 5.0, 120.0, 30.0])
+    spec = BatterySpec(capacity_mwh=1.0, power_mw=0.5, round_trip_efficiency=0.9)
+
+    threshold_revenue = compute_metrics(
+        run_backtest(prices, Battery(spec), ThresholdStrategy(20.0, 50.0), interval_minutes=60)
+    ).total_revenue
+    perfect_revenue = compute_metrics(
+        run_backtest(
+            prices,
+            Battery(spec),
+            PerfectForesightStrategy(spec, interval_minutes=60),
+            interval_minutes=60,
+        )
+    ).total_revenue
+
+    assert perfect_revenue >= threshold_revenue - 1e-6
+    assert capture_rate(threshold_revenue, perfect_revenue) <= 1.0 + 1e-6

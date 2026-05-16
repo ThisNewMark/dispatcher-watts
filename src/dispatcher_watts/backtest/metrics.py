@@ -56,6 +56,17 @@ def compute_metrics(result: BacktestResult) -> BacktestMetrics:
     )
 
 
+def capture_rate(strategy_revenue: float, perfect_foresight_revenue: float) -> float:
+    """Strategy revenue as a fraction of the perfect-foresight ceiling.
+
+    Returns 0.0 when the ceiling is non-positive -- i.e. no profitable
+    arbitrage was available, so there is nothing to capture.
+    """
+    if perfect_foresight_revenue <= 0:
+        return 0.0
+    return strategy_revenue / perfect_foresight_revenue
+
+
 def _soc_distribution(frame: pl.DataFrame, capacity_mwh: float) -> dict[str, float]:
     """Fraction of intervals spent in each 10%-wide state-of-charge band."""
     n = frame.height

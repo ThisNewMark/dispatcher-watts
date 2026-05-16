@@ -6,10 +6,14 @@ import typer
 from dotenv import load_dotenv
 
 from dispatcher_watts.backtest.engine import BacktestResult, run_backtest
-from dispatcher_watts.backtest.metrics import BacktestMetrics, compute_metrics
+from dispatcher_watts.backtest.metrics import (
+    BacktestMetrics,
+    capture_rate,
+    compute_metrics,
+)
 from dispatcher_watts.battery.model import Battery, BatterySpec
 from dispatcher_watts.data.ercot import GridstatusERCOTSource
-from dispatcher_watts.data.schemas import ERCOT_HUBS
+from dispatcher_watts.data.schemas import ERCOT_HUBS, RTM_INTERVAL_MINUTES
 from dispatcher_watts.data.store import (
     cache_path,
     load_prices,
@@ -17,7 +21,12 @@ from dispatcher_watts.data.store import (
     summarize_prices,
 )
 from dispatcher_watts.strategies.base import Strategy
+from dispatcher_watts.strategies.perfect_foresight import PerfectForesightStrategy
+from dispatcher_watts.strategies.rolling_avg import RollingAverageStrategy
 from dispatcher_watts.strategies.threshold import ThresholdStrategy
+
+# Strategies available to the `backtest` and `compare` commands.
+_STRATEGIES: tuple[str, ...] = ("threshold", "rolling-average", "perfect-foresight")
 
 # Load GRIDSTATUS_API_KEY (and any other vars) from a local .env file, if one
 # exists. Real environment variables always take precedence.
@@ -74,13 +83,30 @@ def data_summary(
     _print_summary(hub, year, summarize_prices(load_prices(year, hub)))
 
 
-def _build_strategy(name: str, charge_below: float, discharge_above: float) -> Strategy:
-    if name == "threshold":
-        try:
+def _build_strategy(
+    name: str,
+    *,
+    spec: BatterySpec,
+    interval_minutes: int,
+    charge_below: float,
+    discharge_above: float,
+    window_hours: float,
+    band: float,
+) -> Strategy:
+    try:
+        if name == "threshold":
             return ThresholdStrategy(charge_below=charge_below, discharge_above=discharge_above)
-        except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-    raise typer.BadParameter(f"unknown strategy {name!r}; v1 supports: threshold")
+        if name == "rolling-average":
+            return RollingAverageStrategy(
+                window_hours=window_hours,
+                interval_minutes=interval_minutes,
+                band=band,
+            )
+        if name == "perfect-foresight":
+            return PerfectForesightStrategy(spec, interval_minutes)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    raise typer.BadParameter(f"unknown strategy {name!r}; v1 supports: {', '.join(_STRATEGIES)}")
 
 
 def _print_backtest(hub: str, year: int, result: BacktestResult, metrics: BacktestMetrics) -> None:
@@ -104,10 +130,18 @@ def _print_backtest(hub: str, year: int, result: BacktestResult, metrics: Backte
 def backtest(
     year: int = typer.Option(..., help="Calendar year to backtest (must be cached)."),
     hub: str = typer.Option("HB_HOUSTON", help="ERCOT trading hub."),
-    strategy: str = typer.Option("threshold", help="Dispatch strategy. v1: threshold."),
+    strategy: str = typer.Option(
+        "threshold", help="Strategy: threshold, rolling-average, or perfect-foresight."
+    ),
     charge_below: float = typer.Option(20.0, help="threshold: charge when price <= this ($/MWh)."),
     discharge_above: float = typer.Option(
         50.0, help="threshold: discharge when price >= this ($/MWh)."
+    ),
+    window_hours: float = typer.Option(
+        24.0, help="rolling-average: trailing window length in hours."
+    ),
+    band: float = typer.Option(
+        0.0, help="rolling-average: no-trade band around the average (0-1)."
     ),
     capacity_mwh: float = typer.Option(1.0, help="Battery energy capacity (MWh)."),
     power_mw: float = typer.Option(0.5, help="Battery power rating (MW)."),
@@ -115,12 +149,58 @@ def backtest(
 ) -> None:
     """Backtest a dispatch strategy on cached ERCOT prices for one hub-year."""
     prices = load_prices(year, hub)
-    battery = Battery(
-        BatterySpec(capacity_mwh=capacity_mwh, power_mw=power_mw, round_trip_efficiency=rte)
+    spec = BatterySpec(capacity_mwh=capacity_mwh, power_mw=power_mw, round_trip_efficiency=rte)
+    strat = _build_strategy(
+        strategy,
+        spec=spec,
+        interval_minutes=RTM_INTERVAL_MINUTES,
+        charge_below=charge_below,
+        discharge_above=discharge_above,
+        window_hours=window_hours,
+        band=band,
     )
-    strat = _build_strategy(strategy, charge_below, discharge_above)
-    result = run_backtest(prices, battery, strat)
+    result = run_backtest(prices, Battery(spec), strat)
     _print_backtest(hub, year, result, compute_metrics(result))
+
+
+@app.command("compare")
+def compare(
+    year: int = typer.Option(..., help="Calendar year to compare (must be cached)."),
+    hub: str = typer.Option("HB_HOUSTON", help="ERCOT trading hub."),
+    charge_below: float = typer.Option(20.0, help="threshold charge price ($/MWh)."),
+    discharge_above: float = typer.Option(50.0, help="threshold discharge price ($/MWh)."),
+    window_hours: float = typer.Option(24.0, help="rolling-average window (hours)."),
+    band: float = typer.Option(0.0, help="rolling-average no-trade band (0-1)."),
+    capacity_mwh: float = typer.Option(1.0, help="Battery energy capacity (MWh)."),
+    power_mw: float = typer.Option(0.5, help="Battery power rating (MW)."),
+    rte: float = typer.Option(0.87, help="Round-trip efficiency, 0-1."),
+) -> None:
+    """Run every strategy on one hub-year and report revenue and capture rate."""
+    prices = load_prices(year, hub)
+    spec = BatterySpec(capacity_mwh=capacity_mwh, power_mw=power_mw, round_trip_efficiency=rte)
+    revenue: dict[str, float] = {}
+    cycles: dict[str, float] = {}
+    for name in _STRATEGIES:
+        strat = _build_strategy(
+            name,
+            spec=spec,
+            interval_minutes=RTM_INTERVAL_MINUTES,
+            charge_below=charge_below,
+            discharge_above=discharge_above,
+            window_hours=window_hours,
+            band=band,
+        )
+        metrics = compute_metrics(run_backtest(prices, Battery(spec), strat))
+        revenue[name] = metrics.total_revenue
+        cycles[name] = metrics.equivalent_full_cycles
+
+    ceiling = revenue["perfect-foresight"]
+    typer.echo(f"\nStrategy comparison -- {hub} {year}")
+    typer.echo(f"  {'strategy':<18}{'revenue':>13}{'capture':>10}{'cycles':>9}")
+    for name in _STRATEGIES:
+        money = "$" + format(revenue[name], ",.0f")
+        rate = capture_rate(revenue[name], ceiling)
+        typer.echo(f"  {name:<18}{money:>13}{rate:>9.1%}{cycles[name]:>9.1f}")
 
 
 if __name__ == "__main__":
