@@ -29,11 +29,8 @@ Homepage = "https://github.com/ThisNewMark/dispatcher-watts"
 Repository = "https://github.com/ThisNewMark/dispatcher-watts"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/dispatcher_watts"]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
@@ -55,6 +52,9 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the package straight from src/ rather than relying on the editable
+# install being in a healthy state.
+pythonpath = ["src"]
 addopts = "--cov=dispatcher_watts --cov-report=term-missing"
 
 [tool.mypy]
