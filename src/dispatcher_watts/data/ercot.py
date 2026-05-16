@@ -12,7 +12,7 @@ that swap a one-file change.
 from __future__ import annotations
 
 import os
-from typing import Protocol
+from typing import Any, Protocol
 
 import polars as pl
 
@@ -41,9 +41,7 @@ class _DatasetClient(Protocol):
         end: str,
         filter_column: str,
         filter_value: str,
-        columns: list[str],
-        return_format: str,
-    ) -> pl.DataFrame: ...
+    ) -> Any: ...
 
 
 class GridstatusERCOTSource(MarketDataSource):
@@ -92,10 +90,19 @@ class GridstatusERCOTSource(MarketDataSource):
             end=f"{year + 1}-01-01",
             filter_column="location",
             filter_value=hub,
-            columns=["interval_start_utc", "spp"],
-            return_format="polars",
         )
-        return normalize_rtm_frame(raw)
+        return normalize_rtm_frame(_ensure_polars(raw))
+
+
+def _ensure_polars(frame: Any) -> pl.DataFrame:
+    """Coerce a gridstatus result to a polars DataFrame.
+
+    The released gridstatusio (0.15.1) returns a pandas DataFrame; test fakes
+    return polars directly. Either way the rest of the module works in polars.
+    """
+    if isinstance(frame, pl.DataFrame):
+        return frame
+    return pl.from_pandas(frame)
 
 
 def normalize_rtm_frame(raw: pl.DataFrame) -> pl.DataFrame:
