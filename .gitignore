@@ -4,8 +4,8 @@
 # Generated results — regenerate with `dispatcher-watts reproduce-v1`
 /results/
 
-# Local-only blog draft (not committed to the repo)
-/BLOG_DRAFT_v1.md
+# Local-only blog drafts (not committed to the repo)
+/BLOG_DRAFT_*.md
 
 # Local secrets — copy .env.example to .env and paste your key there.
 # .env.example IS committed as a template; .env never is.
