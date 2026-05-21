@@ -13,7 +13,12 @@ from pathlib import Path
 
 import polars as pl
 
-from dispatcher_watts.data.schemas import RTM_PRICE_SCHEMA, validate_rtm_frame
+from dispatcher_watts.data.schemas import (
+    MCPC_SCHEMA,
+    RTM_PRICE_SCHEMA,
+    validate_mcpc_frame,
+    validate_rtm_frame,
+)
 
 # Repo-root-relative default. Overridable so tests can use a temp directory.
 DEFAULT_DATA_DIR: Path = Path("data") / "ercot"
@@ -46,6 +51,68 @@ def load_prices(year: int, hub: str, data_dir: Path = DEFAULT_DATA_DIR) -> pl.Da
             f"no cached data at {path}; run `dispatcher-watts data fetch` first"
         )
     return validate_rtm_frame(pl.read_parquet(path))
+
+
+def mcpc_cache_path(year: int, data_dir: Path = DEFAULT_DATA_DIR) -> Path:
+    """Return the parquet path for one year of RT AS clearing prices."""
+    return data_dir / str(year) / "mcpc_rt_15min.parquet"
+
+
+def is_mcpc_cached(year: int, data_dir: Path = DEFAULT_DATA_DIR) -> bool:
+    return mcpc_cache_path(year, data_dir).exists()
+
+
+def save_mcpc(df: pl.DataFrame, year: int, data_dir: Path = DEFAULT_DATA_DIR) -> Path:
+    """Validate `df` against MCPC_SCHEMA and write it to the parquet cache."""
+    validate_mcpc_frame(df)
+    path = mcpc_cache_path(year, data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(path)
+    return path
+
+
+def load_mcpc(year: int, data_dir: Path = DEFAULT_DATA_DIR) -> pl.DataFrame:
+    """Load and schema-validate cached AS clearing prices for one year."""
+    path = mcpc_cache_path(year, data_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no cached MCPC at {path}; run `dispatcher-watts data fetch-as` first"
+        )
+    return validate_mcpc_frame(pl.read_parquet(path))
+
+
+def load_mcpc_window(
+    start_date: dt.date,
+    end_date: dt.date,
+    data_dir: Path = DEFAULT_DATA_DIR,
+) -> pl.DataFrame:
+    """Load cached AS clearing prices for `[start_date, end_date)` UTC days.
+
+    Same window semantics as ``load_prices_window``. AS prices are system-wide,
+    so there is no hub parameter.
+    """
+    if start_date >= end_date:
+        raise ValueError(f"start_date ({start_date}) must be before end_date ({end_date})")
+    start_dt = dt.datetime.combine(start_date, dt.time.min, tzinfo=dt.UTC)
+    end_dt = dt.datetime.combine(end_date, dt.time.min, tzinfo=dt.UTC)
+    frames: list[pl.DataFrame] = []
+    for year in range(start_date.year, end_date.year + 1):
+        year_start = dt.date(year, 1, 1)
+        year_end = dt.date(year + 1, 1, 1)
+        if not (start_date < year_end and end_date > year_start):
+            continue
+        path = mcpc_cache_path(year, data_dir)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"no cached MCPC at {path}; "
+                f"run `dispatcher-watts data fetch-as --year {year}` first"
+            )
+        frames.append(pl.read_parquet(path))
+    combined = pl.concat(frames) if frames else pl.DataFrame(schema=MCPC_SCHEMA)
+    sliced = combined.filter(
+        (pl.col("interval_start") >= start_dt) & (pl.col("interval_start") < end_dt)
+    ).sort("interval_start")
+    return validate_mcpc_frame(sliced)
 
 
 def load_prices_window(

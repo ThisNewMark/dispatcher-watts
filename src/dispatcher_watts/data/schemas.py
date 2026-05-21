@@ -41,3 +41,40 @@ def validate_rtm_frame(df: pl.DataFrame) -> pl.DataFrame:
             f"  actual:   {dict(df.schema)}"
         )
     return df
+
+
+# Post-RTC+B (Dec 5, 2025) ERCOT real-time ancillary services clearing prices,
+# co-optimized with energy every 15 minutes. Five products; the strings here
+# match the lowercase column suffixes used in our wide-format MCPC frame.
+MCPC_PRODUCTS: tuple[str, ...] = ("regup", "regdn", "rrs", "ecrs", "nspin")
+
+# Map from ERCOT's `as_type` raw labels to our column suffixes.
+MCPC_RAW_TO_COLUMN: dict[str, str] = {
+    "REGUP": "regup",
+    "REGDN": "regdn",
+    "RRS": "rrs",
+    "ECRS": "ecrs",
+    "NSPIN": "nspin",
+}
+
+# Wide-format schema: one row per 15-min interval, one column per product.
+# Each MCPC value is the clearing price for one MW of capacity committed for
+# the interval ($/MW per 15-min). The same prices apply system-wide -- AS is
+# procured at ERCOT scope, not per hub.
+MCPC_SCHEMA: pl.Schema = pl.Schema(
+    {
+        "interval_start": pl.Datetime(time_unit="us", time_zone="UTC"),
+        **{f"mcpc_{product}": pl.Float64() for product in MCPC_PRODUCTS},
+    }
+)
+
+
+def validate_mcpc_frame(df: pl.DataFrame) -> pl.DataFrame:
+    """Check that `df` matches `MCPC_SCHEMA`, then return it unchanged."""
+    if df.schema != MCPC_SCHEMA:
+        raise ValueError(
+            "MCPC frame does not match MCPC_SCHEMA\n"
+            f"  expected: {dict(MCPC_SCHEMA)}\n"
+            f"  actual:   {dict(df.schema)}"
+        )
+    return df

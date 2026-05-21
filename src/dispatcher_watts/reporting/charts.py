@@ -184,6 +184,27 @@ def rtcb_pct_change_chart(
     return _styled(fig, f"% change in {metric_label}: pre vs post RTC+B", "Hub", "% change")
 
 
+def revenue_stack_chart(
+    revenue_by_source: dict[str, float],
+    title: str = "Revenue by source",
+) -> go.Figure:
+    """Horizontal bars of revenue per source -- the post-RTC+B revenue stack."""
+    # Sort largest-first for readability; reverse so the biggest bar is on top.
+    items = sorted(revenue_by_source.items(), key=lambda kv: kv[1], reverse=False)
+    labels = [name for name, _ in items]
+    values = [amount for _, amount in items]
+    fig = go.Figure()
+    fig.add_bar(
+        x=values,
+        y=labels,
+        orientation="h",
+        marker={"color": _DISCHARGE_COLOR},
+        text=[f"${v:,.0f}" for v in values],
+        textposition="auto",
+    )
+    return _styled(fig, title, "Revenue ($)", "")
+
+
 def save_figure(fig: go.Figure, path: Path) -> Path:
     """Write a figure to `path`: an `.html` interactive file, or a static image.
 

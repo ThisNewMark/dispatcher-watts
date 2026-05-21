@@ -17,21 +17,28 @@ from dispatcher_watts.backtest.metrics import (
     compute_metrics,
 )
 from dispatcher_watts.battery.model import Battery, BatterySpec
+from dispatcher_watts.cooptimization.solver import solve_co_optimization
 from dispatcher_watts.data.ercot import GridstatusERCOTSource
-from dispatcher_watts.data.schemas import ERCOT_HUBS, RTM_INTERVAL_MINUTES
+from dispatcher_watts.data.schemas import ERCOT_HUBS, MCPC_PRODUCTS, RTM_INTERVAL_MINUTES
 from dispatcher_watts.data.store import (
     cache_path,
     is_cached,
+    load_mcpc,
+    load_mcpc_window,
     load_prices,
     load_prices_window,
+    mcpc_cache_path,
+    save_mcpc,
     save_prices,
     summarize_prices,
 )
+from dispatcher_watts.finance.economics import BatteryEconomics, summarize_finance
 from dispatcher_watts.reporting.charts import (
     cumulative_revenue_chart,
     cumulative_revenue_comparison_chart,
     daily_revenue_chart,
     dispatch_chart,
+    revenue_stack_chart,
     rtcb_pct_change_chart,
     rtcb_revenue_comparison_chart,
     save_figure,
@@ -98,6 +105,41 @@ def data_summary(
 ) -> None:
     """Print a statistical summary of cached prices for a hub-year."""
     _print_summary(hub, year, summarize_prices(load_prices(year, hub)))
+
+
+@data_app.command("fetch-as")
+def data_fetch_as(
+    year: int = typer.Option(..., help="Calendar year to fetch, e.g. 2026."),
+    force: bool = typer.Option(False, help="Re-fetch even if a cached file exists."),
+) -> None:
+    """Fetch one year of ERCOT real-time AS clearing prices (post-RTC+B).
+
+    Only Dec 5, 2025 onward is meaningful; earlier dates return empty or
+    sparse data (RTC+B introduced real-time AS clearing).
+    """
+    path = mcpc_cache_path(year)
+    if path.exists() and not force:
+        typer.echo(f"cached file already exists: {path} (use --force to re-fetch)")
+        df = load_mcpc(year)
+    else:
+        typer.echo(f"fetching MCPC {year} from gridstatus.io ...")
+        df = GridstatusERCOTSource().get_rtm_mcpc(year)
+        path = save_mcpc(df, year)
+        typer.echo(f"wrote {df.height:,} intervals to {path}")
+    if df.is_empty():
+        typer.echo("  (frame empty; this is expected for pre-RTC+B years)")
+        return
+    typer.echo(f"\nMCPC {year} -- mean clearing price per 15-min interval ($/MW)")
+    products = ("regup", "regdn", "rrs", "ecrs", "nspin")
+    stats = df.select(
+        *[pl.col(f"mcpc_{p}").mean().alias(f"mean_{p}") for p in products],
+        *[pl.col(f"mcpc_{p}").max().alias(f"max_{p}") for p in products],
+    ).row(0, named=True)
+    for product in products:
+        typer.echo(
+            f"  {product:<6}  mean ${stats[f'mean_{product}']:6.2f}   "
+            f"max ${stats[f'max_{product}']:8.2f}"
+        )
 
 
 def _build_strategy(
@@ -451,6 +493,164 @@ def rtcb_compare(
         charts_dir / "pct_change_pf_revenue.html",
     )
     typer.echo(f"wrote charts -> {charts_dir}")
+
+
+@app.command("revenue-stack")
+def revenue_stack(
+    start: str = typer.Option(
+        "2025-12-05", help="Window start (UTC, inclusive). Default: RTC+B go-live."
+    ),
+    end: str | None = typer.Option(None, help="Window end (UTC, exclusive). Default: today."),
+    hub: str = typer.Option("HB_HOUSTON", help="ERCOT trading hub."),
+    capacity_mwh: float = typer.Option(10.0, help="Battery energy capacity (MWh)."),
+    power_mw: float = typer.Option(2.5, help="Battery power rating (MW)."),
+    rte: float = typer.Option(0.87, help="Round-trip efficiency, 0-1."),
+) -> None:
+    """Co-optimize energy and AS revenue for a post-RTC+B window.
+
+    Solves one LP that allocates the battery's power and state of charge
+    across real-time energy and all five AS products jointly, with full
+    foresight. The result is the post-RTC+B revenue ceiling -- the
+    co-optimized analogue of the v1 perfect-foresight benchmark.
+    """
+    start_date = dt.date.fromisoformat(start)
+    end_date = dt.date.fromisoformat(end) if end else dt.date.today()
+    prices = load_prices_window(start_date, end_date, hub)
+    mcpc = load_mcpc_window(start_date, end_date)
+    spec = BatterySpec(capacity_mwh=capacity_mwh, power_mw=power_mw, round_trip_efficiency=rte)
+    days = (end_date - start_date).days
+    econ = BatteryEconomics()
+
+    typer.echo(f"\nRevenue stack -- {capacity_mwh:g} MWh / {power_mw:g} MW @ {hub}")
+    typer.echo(f"  window     : [{start_date}, {end_date})  -- {days} days")
+    typer.echo(f"  energy obs : {prices.height:,}  AS obs: {mcpc.height:,}")
+    typer.echo(
+        f"  solving 2 LPs: gross-max and degradation-aware "
+        f"(${econ.degradation_cost_per_mwh:.0f}/MWh) ..."
+    )
+
+    out_dir = Path("results") / "rtcb-v2"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary_lines: list[str] = []
+    for mode_label, deg_in_lp in (
+        ("gross-max", 0.0),
+        ("degradation-aware", econ.degradation_cost_per_mwh),
+    ):
+        typer.echo(f"\n  === {mode_label} LP ===")
+        _show_one_mode(
+            prices,
+            mcpc,
+            spec,
+            days,
+            econ,
+            mode_label=mode_label,
+            degradation_in_lp=deg_in_lp,
+            out_dir=out_dir,
+            hub=hub,
+            start_date=start_date,
+            end_date=end_date,
+            summary_out=summary_lines,
+        )
+
+    typer.echo("\n  === Summary: same finance assumptions, different LP objectives ===")
+    typer.echo(f"  {'mode':<22}{'gross':>14}{'net FCF/yr':>16}{'payback':>12}{'CoC':>8}")
+    typer.echo(f"  {'-' * 22}{'-' * 14:>14}{'-' * 16:>16}{'-' * 12:>12}{'-' * 8:>8}")
+    for line in summary_lines:
+        typer.echo("  " + line)
+
+
+def _show_one_mode(
+    prices: pl.DataFrame,
+    mcpc: pl.DataFrame,
+    spec: BatterySpec,
+    days: int,
+    econ: BatteryEconomics,
+    *,
+    mode_label: str,
+    degradation_in_lp: float,
+    out_dir: Path,
+    hub: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    summary_out: list[str],
+) -> None:
+    """Solve one LP variant, print its stack + finance summary, save its chart."""
+    result = solve_co_optimization(prices, mcpc, spec, degradation_cost_per_mwh=degradation_in_lp)
+    annualization = 365.0 / days
+    typer.echo(f"  {'source':<10}{'revenue':>14}{'$/day':>10}{'$/MWh-year':>14}{'share':>8}")
+    typer.echo(f"  {'-' * 10}{'-' * 14:>14}{'-' * 10:>10}{'-' * 14:>14}{'-' * 8:>8}")
+    for source in ("energy", *MCPC_PRODUCTS):
+        amount = result.revenue_by_source[source]
+        per_mwh_year = amount / spec.capacity_mwh * annualization
+        share = amount / result.total_revenue if result.total_revenue else 0.0
+        typer.echo(
+            f"  {source:<10}{'$' + format(amount, ',.0f'):>14}"
+            f"{'$' + format(amount / days, ',.0f'):>10}"
+            f"{'$' + format(per_mwh_year, ',.0f'):>14}{share:>8.1%}"
+        )
+    total = result.total_revenue
+    typer.echo(f"  {'-' * 10}{'-' * 14:>14}{'-' * 10:>10}{'-' * 14:>14}{'-' * 8:>8}")
+    typer.echo(
+        f"  {'TOTAL':<10}{'$' + format(total, ',.0f'):>14}"
+        f"{'$' + format(total / days, ',.0f'):>10}"
+        f"{'$' + format(total / spec.capacity_mwh * annualization, ',.0f'):>14}"
+    )
+
+    throughput_mwh = float(
+        result.frame.select(
+            (pl.col("charge_mwh").sum() + pl.col("discharge_mwh").sum()).alias("t")
+        ).item()
+    )
+    fin = summarize_finance(
+        gross_revenue=total,
+        throughput_mwh=throughput_mwh,
+        capacity_mwh=spec.capacity_mwh,
+        power_mw=spec.power_mw,
+        days_in_window=days,
+        econ=econ,
+    )
+    typer.echo("  Project finance:")
+    typer.echo(f"    gross                          : ${fin.gross_revenue:>14,.0f}")
+    typer.echo(f"    - availability (5%)            : ${fin.availability_haircut:>14,.0f}")
+    typer.echo(f"    - degradation                  : ${fin.degradation_cost:>14,.0f}")
+    typer.echo(f"    - QSE fee (2%)                 : ${fin.qse_fee:>14,.0f}")
+    typer.echo(f"    = net operating                : ${fin.net_operating_revenue:>14,.0f}")
+    typer.echo(
+        f"    annualized                     : ${fin.net_operating_revenue_annualized:>14,.0f}/yr"
+    )
+    typer.echo(f"    - fixed O&M                    : ${fin.fixed_annual_costs:>14,.0f}/yr")
+    typer.echo(
+        f"    = net free cash flow           : ${fin.net_free_cash_flow_annualized:>14,.0f}/yr"
+    )
+    typer.echo(f"    capex after 30% ITC            : ${fin.capex_after_itc:>14,.0f}")
+    if fin.net_free_cash_flow_annualized > 0:
+        typer.echo(f"    simple payback                 : {fin.simple_payback_years:>14.1f} years")
+        typer.echo(f"    cash-on-cash return            : {fin.cash_on_cash_return_pct:>14.1f}%")
+        payback_str = f"{fin.simple_payback_years:.1f} yrs"
+        coc_str = f"{fin.cash_on_cash_return_pct:.1f}%"
+    else:
+        typer.echo("    payback / return               : (free cash flow is negative)")
+        payback_str = "n/a"
+        coc_str = "n/a"
+
+    summary_out.append(
+        f"{mode_label:<22}{'$' + format(total, ',.0f'):>14}"
+        f"{'$' + format(fin.net_free_cash_flow_annualized, ',.0f'):>16}"
+        f"{payback_str:>12}{coc_str:>8}"
+    )
+
+    chart_path = out_dir / f"revenue_stack_{mode_label.replace('-', '_')}.html"
+    save_figure(
+        revenue_stack_chart(
+            result.revenue_by_source,
+            title=(
+                f"Revenue stack ({mode_label}) -- "
+                f"{spec.capacity_mwh:g} MWh / {spec.power_mw:g} MW @ {hub}, "
+                f"[{start_date}, {end_date})"
+            ),
+        ),
+        chart_path,
+    )
 
 
 if __name__ == "__main__":

@@ -17,12 +17,24 @@ from typing import Any, Protocol
 import polars as pl
 
 from dispatcher_watts.data.base import MarketDataSource
-from dispatcher_watts.data.schemas import ERCOT_HUBS, validate_rtm_frame
+from dispatcher_watts.data.schemas import (
+    ERCOT_HUBS,
+    MCPC_PRODUCTS,
+    MCPC_RAW_TO_COLUMN,
+    MCPC_SCHEMA,
+    validate_mcpc_frame,
+    validate_rtm_frame,
+)
 
 # gridstatus.io dataset holding ERCOT real-time (15-minute) settlement-point
 # prices. The price column is `spp` ($/MWh); a hub is selected by filtering the
 # `location` column (e.g. "HB_HOUSTON").
 RTM_DATASET: str = "ercot_spp_real_time_15_min"
+
+# gridstatus.io dataset holding ERCOT real-time (15-minute) market clearing
+# prices for capacity -- i.e. the per-product AS clearing prices co-optimized
+# with energy under RTC+B (Dec 5, 2025 onward). System-wide; not hub-specific.
+MCPC_DATASET: str = "ercot_mcpc_real_time_15_min"
 
 API_KEY_ENV_VAR: str = "GRIDSTATUS_API_KEY"
 
@@ -34,14 +46,7 @@ class _DatasetClient(Protocol):
     call and no API key required.
     """
 
-    def get_dataset(
-        self,
-        dataset: str,
-        start: str,
-        end: str,
-        filter_column: str,
-        filter_value: str,
-    ) -> Any: ...
+    def get_dataset(self, dataset: str, **kwargs: Any) -> Any: ...
 
 
 class GridstatusERCOTSource(MarketDataSource):
@@ -93,6 +98,20 @@ class GridstatusERCOTSource(MarketDataSource):
         )
         return normalize_rtm_frame(_ensure_polars(raw))
 
+    def get_rtm_mcpc(self, year: int) -> pl.DataFrame:
+        """Real-time AS clearing prices for `year`, wide-format by product.
+
+        Only post-RTC+B (Dec 5, 2025 onward) is meaningful; pre-RTC+B the
+        dataset is empty or sparse. The returned frame conforms to
+        ``MCPC_SCHEMA``.
+        """
+        raw = self._get_client().get_dataset(
+            dataset=MCPC_DATASET,
+            start=f"{year}-01-01",
+            end=f"{year + 1}-01-01",
+        )
+        return normalize_mcpc_frame(_ensure_polars(raw))
+
 
 def _ensure_polars(frame: Any) -> pl.DataFrame:
     """Coerce a gridstatus result to a polars DataFrame.
@@ -120,3 +139,42 @@ def normalize_rtm_frame(raw: pl.DataFrame) -> pl.DataFrame:
         price=pl.col("spp").cast(pl.Float64),
     ).sort("interval_start")
     return validate_rtm_frame(normalized)
+
+
+def normalize_mcpc_frame(raw: pl.DataFrame) -> pl.DataFrame:
+    """Convert a raw gridstatus MCPC frame into one matching `MCPC_SCHEMA`.
+
+    Input is long-format (one row per (interval, as_type) pair) with columns
+    `interval_start_utc`, `as_type`, and `mcpc`. Output is wide-format with one
+    row per interval and one ``mcpc_<product>`` column per AS product.
+    """
+    if raw.is_empty():
+        return pl.DataFrame(schema=MCPC_SCHEMA)
+    # Map the raw as_type labels to our column suffixes; pivot to wide.
+    mapping = pl.DataFrame(
+        {
+            "as_type": list(MCPC_RAW_TO_COLUMN),
+            "product": list(MCPC_RAW_TO_COLUMN.values()),
+        }
+    )
+    long = raw.select(
+        pl.col("interval_start_utc").alias("interval_start"),
+        pl.col("as_type"),
+        pl.col("mcpc").cast(pl.Float64),
+    ).join(mapping, on="as_type", how="inner")
+    wide = long.pivot(values="mcpc", index="interval_start", on="product").rename(
+        {p: f"mcpc_{p}" for p in MCPC_PRODUCTS}
+    )
+    # Ensure every product column exists and the dtype matches the schema.
+    wide = wide.with_columns(
+        pl.col("interval_start").cast(pl.Datetime(time_unit="us", time_zone="UTC"))
+    )
+    for product in MCPC_PRODUCTS:
+        col = f"mcpc_{product}"
+        if col not in wide.columns:
+            wide = wide.with_columns(pl.lit(0.0).alias(col))
+        wide = wide.with_columns(pl.col(col).cast(pl.Float64))
+    wide = wide.select(["interval_start", *(f"mcpc_{p}" for p in MCPC_PRODUCTS)]).sort(
+        "interval_start"
+    )
+    return validate_mcpc_frame(wide)
