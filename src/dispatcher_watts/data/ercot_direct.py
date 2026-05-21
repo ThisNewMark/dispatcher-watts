@@ -204,7 +204,7 @@ class ErcotDirectSource(MarketDataSource):
             {
                 "deliveryDateFrom": f"{year}-01-01",
                 "deliveryDateTo": f"{year}-12-31",
-                "settlementPointName": hub,
+                "settlementPoint": hub,
             },
         )
         return normalize_ercot_spp_response(fields, rows)
@@ -254,14 +254,18 @@ def normalize_ercot_spp_response(fields: list[str], rows: list[list[Any]]) -> pl
         price=pl.col("settlementPointPrice").cast(pl.Float64),
         dst_flag=pl.col("DSTFlag"),
     )
-    # Localize to America/Chicago, then convert to UTC. The DST flag column,
-    # when present, tells us which side of the fall-back ambiguous hour the
-    # row belongs to ("Y" -> the repeated hour, i.e. the later instance).
+    # Localize to America/Chicago, then convert to UTC. ERCOT's DST flag
+    # tells us which side of the fall-back ambiguous hour each row belongs
+    # to: the flag is "set" on rows in the repeated hour (the later instance).
+    # The public API sends DSTFlag as bool; some other ERCOT endpoints send
+    # "Y"/"N" strings. Cast to string and accept either form so this is
+    # robust across endpoints.
+    dst_truthy = pl.col("dst_flag").cast(pl.Utf8).is_in(("Y", "true", "True"))
     normalized = normalized.with_columns(
         interval_start=pl.col("local_naive")
         .dt.replace_time_zone(
             "America/Chicago",
-            ambiguous=pl.when(pl.col("dst_flag") == "Y")
+            ambiguous=pl.when(dst_truthy)
             .then(pl.lit("latest"))
             .otherwise(pl.lit("earliest")),
             non_existent="null",
