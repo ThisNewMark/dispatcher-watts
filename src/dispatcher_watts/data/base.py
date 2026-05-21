@@ -26,3 +26,14 @@ class MarketDataSource(ABC):
         ascending by `interval_start`.
         """
         raise NotImplementedError
+
+    def get_rtm_mcpc(self, year: int) -> pl.DataFrame:
+        """Return post-RTC+B real-time AS clearing prices for one year.
+
+        The returned frame conforms to ``MCPC_SCHEMA`` (see `schemas.py`):
+        one row per 15-min interval, one column per AS product, system-wide.
+
+        Default implementation raises ``NotImplementedError`` so that sources
+        without MCPC support trigger fallback in the composite source.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement get_rtm_mcpc")

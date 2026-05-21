@@ -7,6 +7,9 @@
 # Local-only blog drafts (not committed to the repo)
 /BLOG_DRAFT_*.md
 
+# Local-only project notes (not committed)
+/docs/V2_PIECES.md
+
 # Local secrets — copy .env.example to .env and paste your key there.
 # .env.example IS committed as a template; .env never is.
 .env

@@ -18,8 +18,8 @@ from dispatcher_watts.backtest.metrics import (
 )
 from dispatcher_watts.battery.model import Battery, BatterySpec
 from dispatcher_watts.cooptimization.solver import solve_co_optimization
-from dispatcher_watts.data.ercot import GridstatusERCOTSource
 from dispatcher_watts.data.schemas import ERCOT_HUBS, MCPC_PRODUCTS, RTM_INTERVAL_MINUTES
+from dispatcher_watts.data.sources import default_source
 from dispatcher_watts.data.store import (
     cache_path,
     is_cached,
@@ -92,7 +92,7 @@ def data_fetch(
         df = load_prices(year, hub)
     else:
         typer.echo(f"fetching {hub} {year} from gridstatus.io ...")
-        df = GridstatusERCOTSource().get_rtm_prices(year, hub)
+        df = default_source().get_rtm_prices(year, hub)
         path = save_prices(df, year, hub)
         typer.echo(f"wrote {df.height:,} intervals to {path}")
     _print_summary(hub, year, summarize_prices(df))
@@ -123,7 +123,7 @@ def data_fetch_as(
         df = load_mcpc(year)
     else:
         typer.echo(f"fetching MCPC {year} from gridstatus.io ...")
-        df = GridstatusERCOTSource().get_rtm_mcpc(year)
+        df = default_source().get_rtm_mcpc(year)
         path = save_mcpc(df, year)
         typer.echo(f"wrote {df.height:,} intervals to {path}")
     if df.is_empty():
@@ -279,7 +279,7 @@ def reproduce_v1() -> None:
         for hub in ERCOT_HUBS:
             if not is_cached(year, hub):
                 typer.echo(f"fetching missing data: {hub} {year} ...")
-                save_prices(GridstatusERCOTSource().get_rtm_prices(year, hub), year, hub)
+                save_prices(default_source().get_rtm_prices(year, hub), year, hub)
             prices = load_prices(year, hub)
             metrics: dict[str, BacktestMetrics] = {}
             for name in _STRATEGIES:
