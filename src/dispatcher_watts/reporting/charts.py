@@ -133,6 +133,57 @@ def cumulative_revenue_comparison_chart(
     return _styled(fig, "Cumulative revenue by strategy", "Time", "Revenue ($)")
 
 
+def rtcb_revenue_comparison_chart(
+    pre_by_hub: dict[str, float],
+    post_by_hub: dict[str, float],
+    metric_label: str = "Perfect-foresight revenue ($/day)",
+    pre_label: str = "Pre-RTC+B",
+    post_label: str = "Post-RTC+B",
+) -> go.Figure:
+    """Side-by-side bars per hub for a pre vs post-RTC+B metric.
+
+    Both dicts should be keyed by the same hub names. Useful for showing how a
+    revenue number moved across the regime boundary.
+    """
+    hubs = list(pre_by_hub.keys())
+    fig = go.Figure()
+    fig.add_bar(
+        x=hubs,
+        y=[pre_by_hub[h] for h in hubs],
+        name=pre_label,
+        marker={"color": _NEUTRAL_COLOR},
+    )
+    fig.add_bar(
+        x=hubs,
+        y=[post_by_hub[h] for h in hubs],
+        name=post_label,
+        marker={"color": _DISCHARGE_COLOR},
+    )
+    return _styled(fig, f"{pre_label} vs {post_label}", "Hub", metric_label)
+
+
+def rtcb_pct_change_chart(
+    pre_by_hub: dict[str, float],
+    post_by_hub: dict[str, float],
+    metric_label: str = "Perfect-foresight revenue",
+) -> go.Figure:
+    """One bar per hub showing the pre → post percent change in a metric.
+
+    Bars are green for positive change, red for negative -- so the visual
+    answer to "did revenue go up or down at this hub?" is immediate.
+    """
+    hubs = list(pre_by_hub.keys())
+    pct = [
+        ((post_by_hub[h] - pre_by_hub[h]) / pre_by_hub[h] * 100) if pre_by_hub[h] else 0.0
+        for h in hubs
+    ]
+    colors = [_DISCHARGE_COLOR if v >= 0 else _CHARGE_COLOR for v in pct]
+    fig = go.Figure()
+    fig.add_bar(x=hubs, y=pct, marker={"color": colors})
+    fig.add_hline(y=0, line_color="#888", line_width=1)
+    return _styled(fig, f"% change in {metric_label}: pre vs post RTC+B", "Hub", "% change")
+
+
 def save_figure(fig: go.Figure, path: Path) -> Path:
     """Write a figure to `path`: an `.html` interactive file, or a static image.
 

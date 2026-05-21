@@ -8,11 +8,12 @@ and re-read from there. Layout (gitignored):
 
 from __future__ import annotations
 
+import datetime as dt
 from pathlib import Path
 
 import polars as pl
 
-from dispatcher_watts.data.schemas import validate_rtm_frame
+from dispatcher_watts.data.schemas import RTM_PRICE_SCHEMA, validate_rtm_frame
 
 # Repo-root-relative default. Overridable so tests can use a temp directory.
 DEFAULT_DATA_DIR: Path = Path("data") / "ercot"
@@ -45,6 +46,43 @@ def load_prices(year: int, hub: str, data_dir: Path = DEFAULT_DATA_DIR) -> pl.Da
             f"no cached data at {path}; run `dispatcher-watts data fetch` first"
         )
     return validate_rtm_frame(pl.read_parquet(path))
+
+
+def load_prices_window(
+    start_date: dt.date,
+    end_date: dt.date,
+    hub: str,
+    data_dir: Path = DEFAULT_DATA_DIR,
+) -> pl.DataFrame:
+    """Load cached prices for one hub across `[start_date, end_date)` UTC days.
+
+    Concatenates whatever year-files the window touches and returns the
+    schema-validated slice. The end date is exclusive (interpreted as 00:00 UTC
+    of that day). Every year that overlaps the window must already be cached.
+    """
+    if start_date >= end_date:
+        raise ValueError(f"start_date ({start_date}) must be before end_date ({end_date})")
+    start_dt = dt.datetime.combine(start_date, dt.time.min, tzinfo=dt.UTC)
+    end_dt = dt.datetime.combine(end_date, dt.time.min, tzinfo=dt.UTC)
+    frames: list[pl.DataFrame] = []
+    for year in range(start_date.year, end_date.year + 1):
+        # Skip years that don't actually overlap [start_date, end_date).
+        year_start = dt.date(year, 1, 1)
+        year_end = dt.date(year + 1, 1, 1)
+        if not (start_date < year_end and end_date > year_start):
+            continue
+        path = cache_path(year, hub, data_dir)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"no cached data at {path}; "
+                f"run `dispatcher-watts data fetch --year {year} --hub {hub}` first"
+            )
+        frames.append(pl.read_parquet(path))
+    combined = pl.concat(frames) if frames else pl.DataFrame(schema=RTM_PRICE_SCHEMA)
+    sliced = combined.filter(
+        (pl.col("interval_start") >= start_dt) & (pl.col("interval_start") < end_dt)
+    ).sort("interval_start")
+    return validate_rtm_frame(sliced)
 
 
 def summarize_prices(df: pl.DataFrame) -> dict[str, float]:

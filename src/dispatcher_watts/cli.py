@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import shutil
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from dispatcher_watts.data.store import (
     cache_path,
     is_cached,
     load_prices,
+    load_prices_window,
     save_prices,
     summarize_prices,
 )
@@ -30,6 +32,8 @@ from dispatcher_watts.reporting.charts import (
     cumulative_revenue_comparison_chart,
     daily_revenue_chart,
     dispatch_chart,
+    rtcb_pct_change_chart,
+    rtcb_revenue_comparison_chart,
     save_figure,
     soc_chart,
 )
@@ -298,6 +302,153 @@ def reproduce_v1() -> None:
     save_figure(
         cumulative_revenue_comparison_chart(sample_results),
         charts_dir / "comparison_cumulative_revenue_HB_HOUSTON_2024.html",
+    )
+    typer.echo(f"wrote charts -> {charts_dir}")
+
+
+# ERCOT's RTC+B (Real-Time Co-optimization plus Batteries) market redesign went
+# live on this date -- the boundary between the "old" and "new" regimes.
+RTCB_GO_LIVE: dt.date = dt.date(2025, 12, 5)
+
+
+def _backtest_window(
+    start: dt.date,
+    end: dt.date,
+    hub: str,
+    spec: BatterySpec,
+    *,
+    charge_below: float,
+    discharge_above: float,
+    window_hours: float,
+    band: float,
+) -> dict[str, BacktestMetrics]:
+    """Run every strategy on `[start, end)` for one hub; return metrics by name."""
+    prices = load_prices_window(start, end, hub)
+    if prices.is_empty():
+        raise typer.BadParameter(
+            f"no cached prices for {hub} in [{start}, {end}); "
+            f"run `dispatcher-watts data fetch` for the missing year(s)"
+        )
+    metrics: dict[str, BacktestMetrics] = {}
+    for name in _STRATEGIES:
+        strat = _build_strategy(
+            name,
+            spec=spec,
+            interval_minutes=RTM_INTERVAL_MINUTES,
+            charge_below=charge_below,
+            discharge_above=discharge_above,
+            window_hours=window_hours,
+            band=band,
+        )
+        metrics[name] = compute_metrics(run_backtest(prices, Battery(spec), strat))
+    return metrics
+
+
+@app.command("rtcb-compare")
+def rtcb_compare(
+    end_date: str | None = typer.Option(
+        None, help="End of the post-RTC+B window (UTC, exclusive). Default: today."
+    ),
+    capacity_mwh: float = typer.Option(1.0, help="Battery energy capacity (MWh)."),
+    power_mw: float = typer.Option(0.5, help="Battery power rating (MW)."),
+    rte: float = typer.Option(0.87, help="Round-trip efficiency, 0-1."),
+    charge_below: float = typer.Option(20.0, help="threshold charge price ($/MWh)."),
+    discharge_above: float = typer.Option(50.0, help="threshold discharge price ($/MWh)."),
+    window_hours: float = typer.Option(24.0, help="rolling-average window (hours)."),
+    band: float = typer.Option(0.0, help="rolling-average no-trade band (0-1)."),
+) -> None:
+    """Compare energy-arbitrage revenue in matched windows pre and post RTC+B.
+
+    The post-RTC+B window runs from RTC+B go-live (Dec 5, 2025) to `--end-date`.
+    The pre-RTC+B window is the same calendar window one year earlier, so the
+    two are matched on season and length. All three strategies are backtested
+    on both windows for every ERCOT trading hub.
+
+    Caveat: any pre→post delta blends the RTC+B effect with continuing battery
+    saturation. The v1 baseline showed ~20% year-over-year compression from
+    saturation alone, before any regime change. Interpret deltas accordingly.
+    """
+    end = dt.date.fromisoformat(end_date) if end_date else dt.date.today()
+    if end <= RTCB_GO_LIVE:
+        raise typer.BadParameter(f"--end-date {end} must be after RTC+B go-live ({RTCB_GO_LIVE})")
+    post_start, post_end = RTCB_GO_LIVE, end
+    pre_start = RTCB_GO_LIVE - dt.timedelta(days=365)
+    pre_end = end - dt.timedelta(days=365)
+    spec = BatterySpec(capacity_mwh=capacity_mwh, power_mw=power_mw, round_trip_efficiency=rte)
+
+    typer.echo(f"\nRTC+B comparison ({capacity_mwh:g} MWh / {power_mw:g} MW battery)")
+    typer.echo(f"  pre-RTC+B  : [{pre_start}, {pre_end})  -- {(pre_end - pre_start).days} days")
+    typer.echo(f"  post-RTC+B : [{post_start}, {post_end}) -- {(post_end - post_start).days} days")
+
+    rows: list[dict[str, object]] = []
+    pf_pre: dict[str, float] = {}
+    pf_post: dict[str, float] = {}
+    for hub in ERCOT_HUBS:
+        pre_metrics = _backtest_window(
+            pre_start,
+            pre_end,
+            hub,
+            spec,
+            charge_below=charge_below,
+            discharge_above=discharge_above,
+            window_hours=window_hours,
+            band=band,
+        )
+        post_metrics = _backtest_window(
+            post_start,
+            post_end,
+            hub,
+            spec,
+            charge_below=charge_below,
+            discharge_above=discharge_above,
+            window_hours=window_hours,
+            band=band,
+        )
+        pre_days = (pre_end - pre_start).days
+        post_days = (post_end - post_start).days
+        for window_label, window_metrics, days in (
+            ("pre", pre_metrics, pre_days),
+            ("post", post_metrics, post_days),
+        ):
+            ceiling = window_metrics["perfect-foresight"].total_revenue
+            for name in _STRATEGIES:
+                m = window_metrics[name]
+                rows.append(
+                    {
+                        "window": window_label,
+                        "hub": hub,
+                        "strategy": name,
+                        "days": days,
+                        "revenue": round(m.total_revenue, 2),
+                        "revenue_per_day": round(m.total_revenue / days, 2),
+                        "capture_rate": round(capture_rate(m.total_revenue, ceiling), 4),
+                        "equivalent_cycles": round(m.equivalent_full_cycles, 1),
+                    }
+                )
+        pf_pre[hub] = pre_metrics["perfect-foresight"].total_revenue / pre_days
+        pf_post[hub] = post_metrics["perfect-foresight"].total_revenue / post_days
+        typer.echo(
+            f"  {hub:<12} PF $/day  pre {pf_pre[hub]:>7,.0f}  "
+            f"post {pf_post[hub]:>7,.0f}  "
+            f"({(pf_post[hub] - pf_pre[hub]) / pf_pre[hub] * 100:+.1f}%)"
+        )
+
+    out_dir = Path("results") / "rtcb-v1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "results.csv"
+    pl.DataFrame(rows).write_csv(csv_path)
+    typer.echo(f"\nwrote results table -> {csv_path}")
+
+    charts_dir = out_dir / "charts"
+    if charts_dir.exists():
+        shutil.rmtree(charts_dir)
+    save_figure(
+        rtcb_revenue_comparison_chart(pf_pre, pf_post),
+        charts_dir / "pre_vs_post_pf_revenue.html",
+    )
+    save_figure(
+        rtcb_pct_change_chart(pf_pre, pf_post),
+        charts_dir / "pct_change_pf_revenue.html",
     )
     typer.echo(f"wrote charts -> {charts_dir}")
 

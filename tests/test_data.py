@@ -13,6 +13,7 @@ from dispatcher_watts.data.schemas import RTM_PRICE_SCHEMA, validate_rtm_frame
 from dispatcher_watts.data.store import (
     is_cached,
     load_prices,
+    load_prices_window,
     save_prices,
     summarize_prices,
 )
@@ -85,6 +86,49 @@ def test_store_roundtrip(tmp_path: Path) -> None:
 def test_load_prices_missing_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="data fetch"):
         load_prices(2025, "HB_WEST", tmp_path)
+
+
+def _hourly_year_frame(year: int, hub_price_offset: float = 0.0) -> pl.DataFrame:
+    """Hourly frame covering all of `year` -- one row per hour, monotonic prices."""
+    start = dt.datetime(year, 1, 1, tzinfo=dt.UTC)
+    hours = (dt.datetime(year + 1, 1, 1, tzinfo=dt.UTC) - start).days * 24
+    return pl.DataFrame(
+        {
+            "interval_start": [start + dt.timedelta(hours=h) for h in range(hours)],
+            "price": [float(hub_price_offset + h) for h in range(hours)],
+        }
+    ).cast({"interval_start": pl.Datetime(time_unit="us", time_zone="UTC")})
+
+
+def test_load_prices_window_within_one_year(tmp_path: Path) -> None:
+    save_prices(_hourly_year_frame(2025), 2025, "HB_X", tmp_path)
+    window = load_prices_window(dt.date(2025, 6, 1), dt.date(2025, 6, 8), "HB_X", tmp_path)
+    # 7 days x 24 hours = 168 rows.
+    assert window.height == 7 * 24
+    assert window["interval_start"].min() == dt.datetime(2025, 6, 1, tzinfo=dt.UTC)
+    assert window["interval_start"].max() == dt.datetime(2025, 6, 7, 23, tzinfo=dt.UTC)
+
+
+def test_load_prices_window_spans_year_boundary(tmp_path: Path) -> None:
+    save_prices(_hourly_year_frame(2024), 2024, "HB_X", tmp_path)
+    save_prices(_hourly_year_frame(2025, hub_price_offset=10_000), 2025, "HB_X", tmp_path)
+    window = load_prices_window(dt.date(2024, 12, 31), dt.date(2025, 1, 2), "HB_X", tmp_path)
+    assert window.height == 2 * 24
+    # First row is the start of Dec 31 2024; last is the final hour of Jan 1 2025.
+    assert window["interval_start"][0] == dt.datetime(2024, 12, 31, tzinfo=dt.UTC)
+    assert window["interval_start"][-1] == dt.datetime(2025, 1, 1, 23, tzinfo=dt.UTC)
+
+
+def test_load_prices_window_rejects_inverted_range(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must be before"):
+        load_prices_window(dt.date(2025, 1, 2), dt.date(2025, 1, 1), "HB_X", tmp_path)
+
+
+def test_load_prices_window_missing_year_raises(tmp_path: Path) -> None:
+    save_prices(_hourly_year_frame(2024), 2024, "HB_X", tmp_path)
+    # 2025 file is missing; the window touches both years so it must error.
+    with pytest.raises(FileNotFoundError, match="data fetch"):
+        load_prices_window(dt.date(2024, 12, 31), dt.date(2025, 1, 2), "HB_X", tmp_path)
 
 
 def test_summarize_prices() -> None:
