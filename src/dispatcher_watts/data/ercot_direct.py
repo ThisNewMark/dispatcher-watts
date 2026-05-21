@@ -28,13 +28,21 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import polars as pl
 
 from dispatcher_watts.data.base import MarketDataSource
-from dispatcher_watts.data.schemas import ERCOT_HUBS, validate_rtm_frame
+from dispatcher_watts.data.schemas import (
+    ERCOT_HUBS,
+    MCPC_PRODUCTS,
+    MCPC_SCHEMA,
+    validate_mcpc_frame,
+    validate_rtm_frame,
+)
 
 # The OAuth2 B2C token endpoint and the public client id are documented in
 # ERCOT's auth guide; both are static.
@@ -49,6 +57,17 @@ _BASE_URL: str = "https://api.ercot.com/api/public-reports"
 # NP6-905-CD: "Settlement Point Prices at Resource Nodes, Hubs and Load Zones",
 # produced every 15 minutes from SCED LMPs.
 _SPP_ENDPOINT: str = "/np6-905-cd/spp_node_zone_hub"
+
+# NP6-329-CD: "RTD Indicative Real-Time MCPC". Each RTD run (~every 5 min)
+# publishes the projected per-product clearing prices for upcoming 5-minute
+# intervals. For live forward-looking decisions, take the most recent
+# projection covering each interval. (The 15-minute *settled* MCPC report
+# lives at a different endpoint that's still to be located; historical
+# backtests use gridstatus's cached settled data instead.)
+_INDICATIVE_MCPC_ENDPOINT: str = "/np6-329-cd/rtd_ind_mcpc"
+
+# ERCOT REST timestamps are in Central Prevailing Time (no offset suffix).
+_ERCOT_TZ: ZoneInfo = ZoneInfo("America/Chicago")
 
 # How long ERCOT id_tokens are valid. We refresh slightly early to be safe.
 _TOKEN_TTL: dt.timedelta = dt.timedelta(minutes=55)
@@ -140,9 +159,14 @@ class ErcotDirectSource(MarketDataSource):
         return token
 
     def _api_get(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Authenticated GET against `_BASE_URL + endpoint` with retry on 401."""
+        """Authenticated GET with retry on 401 (auth refresh) and 429 (backoff).
+
+        ERCOT enforces a per-minute API rate limit in addition to the monthly
+        budget. On 429 we wait the time the server hints at via Retry-After
+        (or a default), then try again -- a small number of times.
+        """
         _, _, sub_key = self._credentials()
-        for attempt in (1, 2):
+        for attempt in range(1, 5):
             response = self._get_client().get(
                 _BASE_URL + endpoint,
                 headers={
@@ -151,20 +175,26 @@ class ErcotDirectSource(MarketDataSource):
                 },
                 params=params,
             )
-            if response.status_code == 401 and attempt == 1:
+            if response.status_code == 401 and attempt < 4:
                 # Token may have aged out faster than expected; force a refresh.
                 self._token = None
+                continue
+            if response.status_code == 429 and attempt < 4:
+                # ERCOT may send Retry-After in seconds; default to 30s if absent.
+                wait_s = int(response.headers.get("Retry-After", "30"))
+                time.sleep(min(wait_s, 60))
                 continue
             response.raise_for_status()
             data: dict[str, Any] = response.json()
             return data
-        raise RuntimeError("unreachable: api_get loop did not return")
+        raise RuntimeError(f"ERCOT API exhausted retries on {endpoint}")
 
     def _paginated_api_get(
         self,
         endpoint: str,
         base_params: dict[str, Any],
         page_size: int = _DEFAULT_PAGE_SIZE,
+        max_pages: int = 1000,
     ) -> tuple[list[str], list[list[Any]]]:
         """Walk every page; return the field-name list and concatenated rows.
 
@@ -189,7 +219,7 @@ class ErcotDirectSource(MarketDataSource):
             all_rows.extend(body.get("data", []))
             meta = body.get("_meta", {})
             total_pages = int(meta.get("totalPages", 1) or 1)
-            if page >= total_pages or not body.get("data"):
+            if page >= total_pages or page >= max_pages or not body.get("data"):
                 break
             page += 1
         return fields, all_rows
@@ -210,13 +240,48 @@ class ErcotDirectSource(MarketDataSource):
         return normalize_ercot_spp_response(fields, rows)
 
     def get_rtm_mcpc(self, year: int) -> pl.DataFrame:
-        # The post-RTC+B real-time MCPC endpoint name needs verification
-        # against the live API; deliberately not implemented in this first
-        # pass so the composite source falls back to gridstatus for MCPC.
+        # ERCOT publishes 5-minute *indicative* MCPC at the rtd_ind_mcpc
+        # endpoint, but the 15-minute *settled* MCPC report (which is what we
+        # cache historically) lives at a different report we haven't located
+        # yet. Until we find it, MCPC historical fetches fall back to
+        # gridstatus via the composite source. Live 5-min indicative
+        # available via get_indicative_mcpc_window().
         raise NotImplementedError(
-            "ercot-direct MCPC fetch not yet wired -- pending endpoint probe; "
-            "for now MCPC falls back to gridstatus.io via CompositeMarketDataSource"
+            "ercot-direct 15-min settled MCPC fetch is not yet wired; "
+            "for historical MCPC use gridstatus, for live forward MCPC use "
+            "get_indicative_mcpc_window()"
         )
+
+    def get_indicative_mcpc_window(
+        self,
+        start: dt.datetime,
+        end: dt.datetime,
+    ) -> pl.DataFrame:
+        """Return latest-projection 5-min MCPCs for intervals ending in [start, end).
+
+        For each 5-minute interval whose ending falls inside the window, picks
+        the row from the most recent RTD run that projected that interval
+        (i.e. the most up-to-date cleared price). Returns a wide-format frame
+        conforming to ``MCPC_SCHEMA``, with ``interval_start`` = 5 minutes
+        before ``intervalEnding``.
+
+        Use this for **live** decisions; for historical settled MCPCs use the
+        gridstatus-cached data.
+        """
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("start and end must be timezone-aware datetimes")
+        # ERCOT's filter takes naive CPT timestamps in ISO format.
+        start_cpt = start.astimezone(_ERCOT_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+        end_cpt = end.astimezone(_ERCOT_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+        fields, rows = self._paginated_api_get(
+            _INDICATIVE_MCPC_ENDPOINT,
+            {
+                "intervalEndingFrom": start_cpt,
+                "intervalEndingTo": end_cpt,
+            },
+            max_pages=20,
+        )
+        return normalize_ercot_indicative_mcpc_response(fields, rows)
 
 
 def normalize_ercot_spp_response(fields: list[str], rows: list[list[Any]]) -> pl.DataFrame:
@@ -265,9 +330,7 @@ def normalize_ercot_spp_response(fields: list[str], rows: list[list[Any]]) -> pl
         interval_start=pl.col("local_naive")
         .dt.replace_time_zone(
             "America/Chicago",
-            ambiguous=pl.when(dst_truthy)
-            .then(pl.lit("latest"))
-            .otherwise(pl.lit("earliest")),
+            ambiguous=pl.when(dst_truthy).then(pl.lit("latest")).otherwise(pl.lit("earliest")),
             non_existent="null",
         )
         .dt.convert_time_zone("UTC")
@@ -279,4 +342,53 @@ def normalize_ercot_spp_response(fields: list[str], rows: list[list[Any]]) -> pl
     return validate_rtm_frame(normalized)
 
 
-__all__ = ["ErcotDirectSource", "normalize_ercot_spp_response"]
+def normalize_ercot_indicative_mcpc_response(
+    fields: list[str], rows: list[list[Any]]
+) -> pl.DataFrame:
+    """Convert NP6-329-CD response to a frame matching MCPC_SCHEMA.
+
+    The endpoint returns multiple projections per interval (one per RTD run
+    that reached that interval). We keep only the latest projection per
+    intervalEnding, then map ``intervalEnding - 5 min`` (in America/Chicago)
+    to UTC ``interval_start``.
+    """
+    if not rows:
+        return pl.DataFrame(schema=MCPC_SCHEMA)
+    raw = pl.DataFrame(rows, schema=fields, orient="row")
+    # Pick the row with the latest RTDTimestamp for each intervalEnding.
+    raw = (
+        raw.with_columns(
+            pl.col("RTDTimestamp").str.to_datetime("%Y-%m-%dT%H:%M:%S", time_unit="us"),
+            pl.col("intervalEnding").str.to_datetime("%Y-%m-%dT%H:%M:%S", time_unit="us"),
+        )
+        .sort("RTDTimestamp", descending=True)
+        .unique(subset=["intervalEnding"], keep="first")
+    )
+    dst_truthy = pl.col("intervalRepeatHourFlag").cast(pl.Utf8).is_in(("Y", "true", "True"))
+    out = (
+        raw.with_columns(
+            interval_start=(pl.col("intervalEnding") - pl.duration(minutes=5))
+            .dt.replace_time_zone(
+                "America/Chicago",
+                ambiguous=pl.when(dst_truthy).then(pl.lit("latest")).otherwise(pl.lit("earliest")),
+                non_existent="null",
+            )
+            .dt.convert_time_zone("UTC"),
+            mcpc_regup=pl.col("REGUP").cast(pl.Float64),
+            mcpc_regdn=pl.col("REGDN").cast(pl.Float64),
+            mcpc_rrs=pl.col("RRS").cast(pl.Float64),
+            mcpc_ecrs=pl.col("ECRS").cast(pl.Float64),
+            mcpc_nspin=pl.col("NSPIN").cast(pl.Float64),
+        )
+        .select(["interval_start", *(f"mcpc_{p}" for p in MCPC_PRODUCTS)])
+        .drop_nulls("interval_start")
+        .sort("interval_start")
+    )
+    return validate_mcpc_frame(out)
+
+
+__all__ = [
+    "ErcotDirectSource",
+    "normalize_ercot_indicative_mcpc_response",
+    "normalize_ercot_spp_response",
+]
