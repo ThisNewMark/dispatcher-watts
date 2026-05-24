@@ -184,6 +184,12 @@ class ErcotDirectSource(MarketDataSource):
                 wait_s = int(response.headers.get("Retry-After", "30"))
                 time.sleep(min(wait_s, 60))
                 continue
+            if response.status_code == 403 and attempt < 3:
+                # A transient gateway rejection clears on a short retry. A
+                # persistent 403 (e.g. a geo-blocked or non-US exit IP, common
+                # behind a VPN) won't, and falls through to surface clearly.
+                time.sleep(3)
+                continue
             response.raise_for_status()
             data: dict[str, Any] = response.json()
             return data
@@ -238,6 +244,36 @@ class ErcotDirectSource(MarketDataSource):
             },
         )
         return normalize_ercot_spp_response(fields, rows)
+
+    def get_rtm_prices_window(
+        self,
+        start: dt.datetime,
+        end: dt.datetime,
+        hub: str,
+    ) -> pl.DataFrame:
+        """Return RT settlement prices for `hub` with interval in ``[start, end)``.
+
+        The windowed counterpart of `get_rtm_prices`, for the live loop: fetching
+        a whole calendar year every few minutes would be wasteful and rate-limit
+        prone. The SPP endpoint filters by *delivery date* (CPT, day-granular),
+        so we query the day range covering the window and slice to the exact
+        UTC interval afterwards.
+        """
+        if hub not in ERCOT_HUBS:
+            raise ValueError(f"unknown ERCOT hub {hub!r}; expected one of {ERCOT_HUBS}")
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("start and end must be timezone-aware datetimes")
+        fields, rows = self._paginated_api_get(
+            _SPP_ENDPOINT,
+            {
+                "deliveryDateFrom": start.astimezone(_ERCOT_TZ).date().isoformat(),
+                "deliveryDateTo": end.astimezone(_ERCOT_TZ).date().isoformat(),
+                "settlementPoint": hub,
+            },
+            max_pages=50,
+        )
+        frame = normalize_ercot_spp_response(fields, rows)
+        return frame.filter((pl.col("interval_start") >= start) & (pl.col("interval_start") < end))
 
     def get_rtm_mcpc(self, year: int) -> pl.DataFrame:
         # ERCOT publishes 5-minute *indicative* MCPC at the rtd_ind_mcpc

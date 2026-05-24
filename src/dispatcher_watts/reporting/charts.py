@@ -205,6 +205,39 @@ def revenue_stack_chart(
     return _styled(fig, title, "Revenue ($)", "")
 
 
+def live_daily_pnl_chart(decisions: pl.DataFrame) -> go.Figure:
+    """Daily paper-trading P&L from a live decision log, split energy vs AS.
+
+    Expects a frame matching the live decision-log schema (an ``energy_revenue``
+    and an ``as_revenue`` column, one row per interval). Stacked bars per day
+    make the energy-vs-ancillary revenue mix visible across the run.
+    """
+    daily = (
+        decisions.group_by(pl.col("interval_start").dt.date().alias("day"))
+        .agg(
+            pl.col("energy_revenue").sum().alias("energy"),
+            pl.col("as_revenue").sum().alias("ancillary"),
+        )
+        .sort("day")
+    )
+    days = daily["day"].to_list()
+    fig = go.Figure()
+    fig.add_bar(
+        x=days,
+        y=daily["energy"].to_list(),
+        name="Energy",
+        marker={"color": _NEUTRAL_COLOR},
+    )
+    fig.add_bar(
+        x=days,
+        y=daily["ancillary"].to_list(),
+        name="Ancillary services",
+        marker={"color": _DISCHARGE_COLOR},
+    )
+    fig.update_layout(barmode="relative")
+    return _styled(fig, "Live paper-trading daily P&L", "Day", "Revenue ($)")
+
+
 def save_figure(fig: go.Figure, path: Path) -> Path:
     """Write a figure to `path`: an `.html` interactive file, or a static image.
 

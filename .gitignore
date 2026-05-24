@@ -1,11 +1,21 @@
-# Market data — fetched locally, never committed (gridstatus row budget)
+# Market data — fetched locally, never committed (gridstatus row budget).
+# Also covers data/live/, the live simulator's append-only capture log.
 /data/
+
+# Live paper-trading simulator state (SoC, running P&L, decision log)
+/state/
+
+# Competition SQLite database (created at the project home by default)
+/competition.db
 
 # Generated results — regenerate with `dispatcher-watts reproduce-v1`
 /results/
 
 # Local-only blog drafts (not committed to the repo)
 /BLOG_DRAFT_*.md
+
+# Local-only working notes (not committed)
+/STRATEGY_IDEAS.md
 
 # Local-only project notes (not committed)
 /docs/V2_PIECES.md
