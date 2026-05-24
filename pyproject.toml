@@ -19,6 +19,7 @@ dependencies = [
     "scipy>=1.13",
     "gridstatusio[polars]>=0.15",
     "python-dotenv>=1.0",
+    "mcp>=1.2",
 ]
 
 [project.scripts]
@@ -55,6 +56,11 @@ src = ["src", "tests"]
 # E/W pycodestyle, F pyflakes, I import-sort, N naming, UP pyupgrade,
 # B bugbear, SIM simplify.
 select = ["E", "W", "F", "I", "N", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# typer expresses CLI options/arguments as call-valued parameter defaults by
+# design, so these are not the mutable-default footgun B008 targets.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
