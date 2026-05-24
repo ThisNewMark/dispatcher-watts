@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import datetime as dt
 import shutil
+import time
 from pathlib import Path
 
+import httpx
 import polars as pl
 import typer
 from dotenv import load_dotenv
@@ -17,7 +19,14 @@ from dispatcher_watts.backtest.metrics import (
     compute_metrics,
 )
 from dispatcher_watts.battery.model import Battery, BatterySpec
+from dispatcher_watts.competition.factory import create_service as create_competition_service
 from dispatcher_watts.cooptimization.solver import solve_co_optimization
+from dispatcher_watts.data.ercot_direct import ErcotDirectSource
+from dispatcher_watts.data.live_capture import (
+    DEFAULT_LIVE_DIR,
+    load_captured_mcpc_window,
+    load_captured_prices_window,
+)
 from dispatcher_watts.data.schemas import ERCOT_HUBS, MCPC_PRODUCTS, RTM_INTERVAL_MINUTES
 from dispatcher_watts.data.sources import default_source
 from dispatcher_watts.data.store import (
@@ -33,11 +42,21 @@ from dispatcher_watts.data.store import (
     summarize_prices,
 )
 from dispatcher_watts.finance.economics import BatteryEconomics, summarize_finance
+from dispatcher_watts.live.analysis import live_capture_rate
+from dispatcher_watts.live.runner import LiveConfig, RunSummary, run_once
+from dispatcher_watts.live.state import (
+    DEFAULT_STATE_DIR,
+    REVENUE_SOURCES,
+    load_decisions,
+    load_state,
+    state_exists,
+)
 from dispatcher_watts.reporting.charts import (
     cumulative_revenue_chart,
     cumulative_revenue_comparison_chart,
     daily_revenue_chart,
     dispatch_chart,
+    live_daily_pnl_chart,
     revenue_stack_chart,
     rtcb_pct_change_chart,
     rtcb_revenue_comparison_chart,
@@ -651,6 +670,236 @@ def _show_one_mode(
         ),
         chart_path,
     )
+
+
+def _print_live_summary(summary: RunSummary) -> None:
+    state = summary.state
+    spec = state.spec
+    typer.echo(
+        f"\nLive paper-trading -- {state.strategy_name} on {state.hub} "
+        f"({spec.capacity_mwh:g} MWh / {spec.power_mw:g} MW)"
+    )
+    typer.echo(
+        f"  window             : [{summary.window_start:%Y-%m-%d %H:%M}, "
+        f"{summary.window_end:%Y-%m-%d %H:%M}) UTC"
+    )
+    typer.echo(f"  intervals this run : {summary.intervals_processed}")
+    if summary.intervals_processed == 0:
+        typer.echo("  (no new settled intervals yet -- try again later)")
+        return
+    typer.echo(f"  state of charge    : {state.soc_mwh:.2f} / {spec.capacity_mwh:g} MWh")
+    typer.echo(f"  equivalent cycles  : {state.equivalent_full_cycles:.1f}")
+    typer.echo("  cumulative revenue by source ($):")
+    for source in REVENUE_SOURCES:
+        amount = state.revenue_by_source[source]
+        if amount:
+            typer.echo(f"    {source:<8} {amount:>12,.2f}")
+    typer.echo(f"  total revenue      : ${state.total_revenue:,.2f}")
+
+
+@app.command("simulate-live")
+def simulate_live(
+    hub: str = typer.Option("HB_HOUSTON", help="ERCOT trading hub."),
+    capacity_mwh: float = typer.Option(10.0, help="Battery energy capacity (MWh)."),
+    power_mw: float = typer.Option(2.5, help="Battery power rating (MW)."),
+    rte: float = typer.Option(0.87, help="Round-trip efficiency, 0-1."),
+    charge_below: float = typer.Option(20.0, help="Energy: charge when price <= this ($/MWh)."),
+    discharge_above: float = typer.Option(
+        50.0, help="Energy: discharge when price >= this ($/MWh)."
+    ),
+    as_capacity_fraction: float = typer.Option(
+        0.5, help="Fraction of power reserved for the leading AS product."
+    ),
+    allocation_interval_minutes: float = typer.Option(
+        5.0, help="How often to re-pick the AS leader (5=every tick, 60=hourly lock)."
+    ),
+    lookback_hours: float = typer.Option(
+        3.0, help="On the first run, how far back to backfill intervals."
+    ),
+    initial_soc_mwh: float = typer.Option(0.0, help="Starting state of charge (MWh), first run."),
+    watch: bool = typer.Option(False, help="Keep polling every --poll-seconds instead of once."),
+    poll_seconds: int = typer.Option(300, help="Seconds between polls when --watch is set."),
+    state_dir: Path | None = typer.Option(None, help="Override the state directory."),
+    data_dir: Path | None = typer.Option(None, help="Override the captured-data directory."),
+) -> None:
+    """Run the deployable live paper-trading simulator for one polling tick.
+
+    Fetches newly-settled intervals from ERCOT direct, dispatches them with the
+    follow-the-leader strategy, banks energy + AS revenue, and persists state so
+    the run resumes next time. Designed to be driven by an external scheduler
+    (cron, systemd timer); --watch is a convenience loop for a foreground run.
+
+    State and captured data live under the project home by default (independent
+    of the working directory); set DISPATCHER_WATTS_HOME or pass --state-dir /
+    --data-dir to relocate them. On resume the stored battery/strategy config is
+    reused; the other options only take effect when no state exists yet.
+    """
+    state_dir = state_dir or DEFAULT_STATE_DIR
+    data_dir = data_dir or DEFAULT_LIVE_DIR
+    config = LiveConfig(
+        hub=hub,
+        spec=BatterySpec(capacity_mwh=capacity_mwh, power_mw=power_mw, round_trip_efficiency=rte),
+        strategy_name="follow-the-leader",
+        strategy_config={
+            "charge_below": charge_below,
+            "discharge_above": discharge_above,
+            "as_capacity_fraction": as_capacity_fraction,
+            "allocation_interval_minutes": allocation_interval_minutes,
+        },
+        lookback_hours=lookback_hours,
+        initial_soc_mwh=initial_soc_mwh,
+    )
+    if state_exists(state_dir):
+        typer.echo("resuming existing run (stored battery/strategy config is authoritative)")
+
+    source = ErcotDirectSource()
+
+    def tick() -> None:
+        try:
+            summary = run_once(source, config, state_dir=state_dir, data_dir=data_dir)
+        except httpx.HTTPError as exc:
+            # An unattended loop must not crash on a transient network/API
+            # hiccup (DNS blip, 403/5xx, timeout). Log one tidy line and let
+            # the next scheduled run retry; state on disk is untouched.
+            typer.echo(f"skipped tick: {type(exc).__name__} talking to ERCOT; will retry next run")
+            return
+        _print_live_summary(summary)
+
+    if not watch:
+        tick()
+        return
+    typer.echo(f"watching: polling every {poll_seconds}s (Ctrl-C to stop)")
+    try:
+        while True:
+            tick()
+            time.sleep(poll_seconds)
+    except KeyboardInterrupt:
+        typer.echo("\nstopped.")
+
+
+@app.command("live-capture-rate")
+def live_capture_rate_cmd(
+    degradation_aware: bool = typer.Option(
+        False, help="Use the degradation-aware LP as the ceiling instead of gross-max."
+    ),
+    state_dir: Path | None = typer.Option(None, help="Override the state directory."),
+    data_dir: Path | None = typer.Option(None, help="Override the captured-data directory."),
+) -> None:
+    """Measure the live run's capture rate against the foresight LP ceiling.
+
+    Replays the perfect-foresight co-optimization over the *captured* data the
+    live run observed, then reports the live strategy's realized revenue as a
+    fraction of that ceiling -- the headline honesty metric. Shares the
+    indicative-MCPC caveat with the rest of the simulator.
+    """
+    state_dir = state_dir or DEFAULT_STATE_DIR
+    data_dir = data_dir or DEFAULT_LIVE_DIR
+    if not state_exists(state_dir):
+        raise typer.BadParameter("no live state found; run `dispatcher-watts simulate-live` first")
+    state = load_state(state_dir)
+    decisions = load_decisions(state_dir)
+    if decisions.is_empty():
+        typer.echo("decision log is empty; nothing to measure yet")
+        return
+
+    interval = dt.timedelta(minutes=state.interval_minutes)
+    first = decisions["interval_start"].min()
+    last = decisions["interval_start"].max()
+    assert isinstance(first, dt.datetime) and isinstance(last, dt.datetime)
+    prices = load_captured_prices_window(first, last + interval, state.hub, data_dir)
+    mcpc = load_captured_mcpc_window(first, last + interval, data_dir)
+    econ = BatteryEconomics()
+    deg = econ.degradation_cost_per_mwh if degradation_aware else 0.0
+
+    try:
+        result = live_capture_rate(
+            decisions, prices, mcpc, state.spec, degradation_cost_per_mwh=deg
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    label = "degradation-aware" if degradation_aware else "gross-max"
+    typer.echo(f"\nLive capture rate -- {state.strategy_name} on {state.hub} ({label} ceiling)")
+    typer.echo(f"  intervals          : {result.intervals:,}")
+    typer.echo(f"  live actual        : ${result.actual_revenue:,.2f}")
+    typer.echo(f"  foresight ceiling  : ${result.ceiling_revenue:,.2f}")
+    typer.echo(f"  capture rate       : {result.capture_rate:.1%}")
+    typer.echo(f"  {'source':<10}{'actual':>14}{'ceiling':>14}")
+    for source in REVENUE_SOURCES:
+        actual = result.actual_by_source.get(source, 0.0)
+        ceiling = result.ceiling_by_source.get(source, 0.0)
+        if actual or ceiling:
+            typer.echo(
+                f"  {source:<10}{'$' + format(actual, ',.0f'):>14}"
+                f"{'$' + format(ceiling, ',.0f'):>14}"
+            )
+
+
+@app.command("competition-heartbeat")
+def competition_heartbeat(
+    watch: bool = typer.Option(False, help="Keep ticking every --poll-seconds instead of once."),
+    poll_seconds: int = typer.Option(300, help="Seconds between heartbeats when --watch is set."),
+) -> None:
+    """Advance the competition market and drive the house bot (one scheduler tick).
+
+    Designed for an external scheduler (Railway cron / a worker). The lazy
+    catch-up also runs on MCP reads, so this only needs to fire often enough to
+    keep the market and the house bot current during quiet periods.
+    """
+    service = create_competition_service()
+
+    def tick() -> None:
+        try:
+            summary = service.run_heartbeat()
+        except httpx.HTTPError as exc:
+            typer.echo(f"skipped heartbeat: {type(exc).__name__} talking to ERCOT; will retry")
+            return
+        typer.echo(
+            f"heartbeat: {summary.intervals_processed} interval(s) processed; "
+            f"window [{summary.window_start:%Y-%m-%d %H:%M}, {summary.window_end:%H:%M}) UTC"
+        )
+
+    if not watch:
+        tick()
+        return
+    typer.echo(f"watching: heartbeat every {poll_seconds}s (Ctrl-C to stop)")
+    try:
+        while True:
+            tick()
+            time.sleep(poll_seconds)
+    except KeyboardInterrupt:
+        typer.echo("\nstopped.")
+
+
+@app.command("live-report")
+def live_report(
+    state_dir: Path | None = typer.Option(None, help="Override the state directory."),
+) -> None:
+    """Write the live run's P&L chart + decisions CSV to results/live/.
+
+    Reads the persisted decision log and state; produces a daily P&L chart
+    (energy vs AS) and a full CSV of every interval's decision.
+    """
+    state_dir = state_dir or DEFAULT_STATE_DIR
+    if not state_exists(state_dir):
+        raise typer.BadParameter("no live state found; run `dispatcher-watts simulate-live` first")
+    state = load_state(state_dir)
+    decisions = load_decisions(state_dir)
+    if decisions.is_empty():
+        typer.echo("decision log is empty; nothing to report yet")
+        return
+
+    out_dir = Path("results") / "live"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "decisions.csv"
+    decisions.write_csv(csv_path)
+    chart_path = save_figure(live_daily_pnl_chart(decisions), out_dir / "pnl.html")
+
+    typer.echo(f"\nLive report -- {state.strategy_name} on {state.hub}")
+    typer.echo(f"  intervals          : {decisions.height:,}")
+    typer.echo(f"  total revenue      : ${state.total_revenue:,.2f}")
+    typer.echo(f"  decisions CSV      -> {csv_path}")
+    typer.echo(f"  P&L chart          -> {chart_path}")
 
 
 if __name__ == "__main__":
